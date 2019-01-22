@@ -58,6 +58,7 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
@@ -133,8 +134,8 @@ public class SignalServiceAccountManager {
    *
    * @throws IOException
    */
-  public void requestSmsVerificationCode() throws IOException {
-    this.pushServiceSocket.createAccount(false);
+  public void requestSmsVerificationCode(boolean androidSmsRetrieverSupported) throws IOException {
+    this.pushServiceSocket.requestSmsVerificationCode(androidSmsRetrieverSupported);
   }
 
   /**
@@ -143,8 +144,8 @@ public class SignalServiceAccountManager {
    *
     * @throws IOException
    */
-  public void requestVoiceVerificationCode() throws IOException {
-    this.pushServiceSocket.createAccount(true);
+  public void requestVoiceVerificationCode(Locale locale) throws IOException {
+    this.pushServiceSocket.requestVoiceVerificationCode(locale);
   }
 
   /**

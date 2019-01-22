@@ -61,10 +61,13 @@ import java.net.URLEncoder;
 import java.security.KeyManagementException;
 import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
-import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
@@ -91,7 +94,7 @@ public class PushServiceSocket {
 
   private static final String TAG = PushServiceSocket.class.getSimpleName();
 
-  private static final String CREATE_ACCOUNT_SMS_PATH   = "/v1/accounts/sms/code/%s";
+  private static final String CREATE_ACCOUNT_SMS_PATH   = "/v1/accounts/sms/code/%s?client=%s";
   private static final String CREATE_ACCOUNT_VOICE_PATH = "/v1/accounts/voice/code/%s";
   private static final String VERIFY_ACCOUNT_CODE_PATH  = "/v1/accounts/code/%s";
   private static final String REGISTER_GCM_PATH         = "/v1/accounts/gcm/";
@@ -120,29 +123,35 @@ public class PushServiceSocket {
 
   private static final String SENDER_CERTIFICATE_PATH   = "/v1/certificate/delivery";
 
+  private static final Map<String, String> NO_HEADERS = Collections.emptyMap();
+
   private       long      soTimeoutMillis = TimeUnit.SECONDS.toMillis(30);
   private final Set<Call> connections     = new HashSet<>();
 
-  private final ConnectionHolder[]  serviceClients;
-  private final ConnectionHolder[]  cdnClients;
-  private final ConnectionHolder[]  contactDiscoveryClients;
+  private final ServiceConnectionHolder[]  serviceClients;
+  private final ConnectionHolder[]         cdnClients;
+  private final ConnectionHolder[]         contactDiscoveryClients;
 
   private final CredentialsProvider credentialsProvider;
   private final String              userAgent;
   private final SecureRandom        random;
 
   public PushServiceSocket(SignalServiceConfiguration signalServiceConfiguration, CredentialsProvider credentialsProvider, String userAgent) {
-    this.credentialsProvider     = credentialsProvider;
-    this.userAgent               = userAgent;
-    this.serviceClients          = createConnectionHolders(signalServiceConfiguration.getSignalServiceUrls());
-    this.cdnClients              = createConnectionHolders(signalServiceConfiguration.getSignalCdnUrls());
-    this.contactDiscoveryClients = createConnectionHolders(signalServiceConfiguration.getSignalContactDiscoveryUrls());
-    this.random                  = new SecureRandom();
+    this.credentialsProvider               = credentialsProvider;
+    this.userAgent                         = userAgent;
+    this.serviceClients                    = createServiceConnectionHolders(signalServiceConfiguration.getSignalServiceUrls());
+    this.cdnClients                        = createConnectionHolders(signalServiceConfiguration.getSignalCdnUrls());
+    this.contactDiscoveryClients           = createConnectionHolders(signalServiceConfiguration.getSignalContactDiscoveryUrls());
+    this.random                            = new SecureRandom();
   }
 
-  public void createAccount(boolean voice) throws IOException {
-    String path = voice ? CREATE_ACCOUNT_VOICE_PATH : CREATE_ACCOUNT_SMS_PATH;
-    makeServiceRequest(String.format(path, credentialsProvider.getUser()), "GET", null);
+  public void requestSmsVerificationCode(boolean androidSmsRetriever) throws IOException {
+    makeServiceRequest(String.format(CREATE_ACCOUNT_SMS_PATH, credentialsProvider.getUser(), androidSmsRetriever ? "android-ng" : "android"), "GET", null, NO_HEADERS);
+  }
+
+  public void requestVoiceVerificationCode(Locale locale) throws IOException {
+    Map<String, String> headers = locale != null ? Collections.singletonMap("Accept-Language", locale.getLanguage() + "-" + locale.getCountry()) : NO_HEADERS;
+    makeServiceRequest(String.format(CREATE_ACCOUNT_VOICE_PATH, credentialsProvider.getUser()), "GET", null, headers);
   }
 
   public void verifyAccountCode(String verificationCode, String signalingKey, int registrationId, boolean fetchesMessages, String pin,
@@ -210,7 +219,7 @@ public class PushServiceSocket {
       throws IOException
   {
     try {
-      String responseText = makeServiceRequest(String.format(MESSAGE_PATH, bundle.getDestination()), "PUT", JsonUtil.toJson(bundle), unidentifiedAccess);
+      String responseText = makeServiceRequest(String.format(MESSAGE_PATH, bundle.getDestination()), "PUT", JsonUtil.toJson(bundle), NO_HEADERS, unidentifiedAccess);
 
       if (responseText == null) return new SendMessageResponse(false);
       else                      return JsonUtil.fromJson(responseText, SendMessageResponse.class);
@@ -278,7 +287,7 @@ public class PushServiceSocket {
         path = path + "?relay=" + destination.getRelay().get();
       }
 
-      String             responseText = makeServiceRequest(path, "GET", null, unidentifiedAccess);
+      String             responseText = makeServiceRequest(path, "GET", null, NO_HEADERS, unidentifiedAccess);
       PreKeyResponse     response     = JsonUtil.fromJson(responseText, PreKeyResponse.class);
       List<PreKeyBundle> bundles      = new LinkedList<>();
 
@@ -397,7 +406,7 @@ public class PushServiceSocket {
       throws NonSuccessfulResponseCodeException, PushNetworkException
   {
     try {
-      String response = makeServiceRequest(String.format(PROFILE_PATH, target.getNumber()), "GET", null, unidentifiedAccess);
+      String response = makeServiceRequest(String.format(PROFILE_PATH, target.getNumber()), "GET", null, NO_HEADERS, unidentifiedAccess);
       return JsonUtil.fromJson(response, SignalServiceProfile.class);
     } catch (IOException e) {
       Log.w(TAG, e);
@@ -754,13 +763,19 @@ public class PushServiceSocket {
   private String makeServiceRequest(String urlFragment, String method, String body)
       throws NonSuccessfulResponseCodeException, PushNetworkException
   {
-    return makeServiceRequest(urlFragment, method, body, Optional.<UnidentifiedAccess>absent());
+    return makeServiceRequest(urlFragment, method, body, NO_HEADERS, Optional.<UnidentifiedAccess>absent());
   }
 
-  private String makeServiceRequest(String urlFragment, String method, String body, Optional<UnidentifiedAccess> unidentifiedAccessKey)
+  private String makeServiceRequest(String urlFragment, String method, String body, Map<String, String> headers)
       throws NonSuccessfulResponseCodeException, PushNetworkException
   {
-    Response response = getServiceConnection(urlFragment, method, body, unidentifiedAccessKey);
+    return makeServiceRequest(urlFragment, method, body, headers, Optional.<UnidentifiedAccess>absent());
+  }
+
+  private String makeServiceRequest(String urlFragment, String method, String body, Map<String, String> headers, Optional<UnidentifiedAccess> unidentifiedAccessKey)
+      throws NonSuccessfulResponseCodeException, PushNetworkException
+  {
+    Response response = getServiceConnection(urlFragment, method, body, headers, unidentifiedAccessKey);
 
     int    responseCode;
     String responseMessage;
@@ -844,16 +859,16 @@ public class PushServiceSocket {
     return responseBody;
   }
 
-  private Response getServiceConnection(String urlFragment, String method, String body, Optional<UnidentifiedAccess> unidentifiedAccess)
+  private Response getServiceConnection(String urlFragment, String method, String body, Map<String, String> headers, Optional<UnidentifiedAccess> unidentifiedAccess)
       throws PushNetworkException
   {
     try {
-      ConnectionHolder connectionHolder = getRandom(serviceClients, random);
-      OkHttpClient     okHttpClient     = connectionHolder.getClient().newBuilder()
-                                                          .connectTimeout(soTimeoutMillis, TimeUnit.MILLISECONDS)
-                                                          .readTimeout(soTimeoutMillis, TimeUnit.MILLISECONDS)
-                                                          .connectionSpecs(Arrays.asList(ConnectionSpec.MODERN_TLS, ConnectionSpec.CLEARTEXT)) // XXXX
-                                                          .build();
+      ServiceConnectionHolder connectionHolder = (ServiceConnectionHolder) getRandom(serviceClients, random);
+      OkHttpClient            baseClient       = unidentifiedAccess.isPresent() ? connectionHolder.getUnidentifiedClient() : connectionHolder.getClient();
+      OkHttpClient            okHttpClient     = baseClient.newBuilder()
+                                                           .connectTimeout(soTimeoutMillis, TimeUnit.MILLISECONDS)
+                                                           .readTimeout(soTimeoutMillis, TimeUnit.MILLISECONDS)
+                                                           .build();
 
       Log.w(TAG, "Push service URL: " + connectionHolder.getUrl());
       Log.w(TAG, "Opening URL: " + String.format("%s%s", connectionHolder.getUrl(), urlFragment));
@@ -865,6 +880,10 @@ public class PushServiceSocket {
         request.method(method, RequestBody.create(MediaType.parse("application/json"), body));
       } else {
         request.method(method, null);
+      }
+
+      for (Map.Entry<String, String> header : headers.entrySet()) {
+        request.addHeader(header.getKey(), header.getValue());
       }
 
       if (unidentifiedAccess.isPresent()) {
@@ -954,25 +973,39 @@ public class PushServiceSocket {
     throw new NonSuccessfulResponseCodeException("Response: " + response);
   }
 
+  private ServiceConnectionHolder[] createServiceConnectionHolders(SignalUrl[] urls) {
+    List<ServiceConnectionHolder> serviceConnectionHolders = new LinkedList<>();
+
+    for (SignalUrl url : urls) {
+      serviceConnectionHolders.add(new ServiceConnectionHolder(createConnectionClient(url),
+                                                               createConnectionClient(url),
+                                                               url.getUrl(), url.getHostHeader()));
+    }
+
+    return serviceConnectionHolders.toArray(new ServiceConnectionHolder[0]);
+  }
+
   private ConnectionHolder[] createConnectionHolders(SignalUrl[] urls) {
+    List<ConnectionHolder> connectionHolders = new LinkedList<>();
+
+    for (SignalUrl url : urls) {
+      connectionHolders.add(new ConnectionHolder(createConnectionClient(url), url.getUrl(), url.getHostHeader()));
+    }
+
+    return connectionHolders.toArray(new ConnectionHolder[0]);
+  }
+
+  private OkHttpClient createConnectionClient(SignalUrl url) {
     try {
-      List<ConnectionHolder> connectionHolders = new LinkedList<>();
+      TrustManager[] trustManagers = BlacklistingTrustManager.createFor(url.getTrustStore());
 
-      for (SignalUrl url : urls) {
-        TrustManager[] trustManagers = BlacklistingTrustManager.createFor(url.getTrustStore());
+      SSLContext context = SSLContext.getInstance("TLS");
+      context.init(null, trustManagers, null);
 
-        SSLContext context = SSLContext.getInstance("TLS");
-        context.init(null, trustManagers, null);
-
-        OkHttpClient client = new OkHttpClient.Builder()
-                                              .sslSocketFactory(context.getSocketFactory(), (X509TrustManager)trustManagers[0])
-                                              .connectionSpecs(url.getConnectionSpecs().or(Util.immutableList(ConnectionSpec.MODERN_TLS, ConnectionSpec.COMPATIBLE_TLS)))
-                                              .build();
-
-        connectionHolders.add(new ConnectionHolder(client, url.getUrl(), url.getHostHeader()));
-      }
-
-      return connectionHolders.toArray(new ConnectionHolder[0]);
+      return new OkHttpClient.Builder()
+                             .sslSocketFactory(context.getSocketFactory(), (X509TrustManager)trustManagers[0])
+                             .connectionSpecs(url.getConnectionSpecs().or(Util.immutableList(ConnectionSpec.MODERN_TLS, ConnectionSpec.COMPATIBLE_TLS)))
+                             .build();
     } catch (NoSuchAlgorithmException | KeyManagementException e) {
       throw new AssertionError(e);
     }
@@ -1041,7 +1074,9 @@ public class PushServiceSocket {
     }
   }
 
+
   private static class ConnectionHolder {
+
     private final OkHttpClient     client;
     private final String           url;
     private final Optional<String> hostHeader;
@@ -1052,7 +1087,7 @@ public class PushServiceSocket {
       this.hostHeader = hostHeader;
     }
 
-    public OkHttpClient getClient() {
+    OkHttpClient getClient() {
       return client;
     }
 
@@ -1060,8 +1095,23 @@ public class PushServiceSocket {
       return url;
     }
 
-    public Optional<String> getHostHeader() {
+    Optional<String> getHostHeader() {
       return hostHeader;
     }
   }
+
+  private static class ServiceConnectionHolder extends ConnectionHolder {
+
+    private final OkHttpClient unidentifiedClient;
+
+    private ServiceConnectionHolder(OkHttpClient identifiedClient, OkHttpClient unidentifiedClient, String url, Optional<String> hostHeader) {
+      super(identifiedClient, url, hostHeader);
+      this.unidentifiedClient = unidentifiedClient;
+    }
+
+    OkHttpClient getUnidentifiedClient() {
+      return unidentifiedClient;
+    }
+  }
+
 }

@@ -23,6 +23,7 @@ import org.whispersystems.signalservice.api.crypto.UnidentifiedAccessPair;
 import org.whispersystems.signalservice.api.crypto.UntrustedIdentityException;
 import org.whispersystems.signalservice.api.messages.SendMessageResult;
 import org.whispersystems.signalservice.api.messages.SignalServiceAttachment;
+import org.whispersystems.signalservice.api.messages.SignalServiceAttachmentPointer;
 import org.whispersystems.signalservice.api.messages.SignalServiceAttachmentStream;
 import org.whispersystems.signalservice.api.messages.SignalServiceDataMessage;
 import org.whispersystems.signalservice.api.messages.SignalServiceGroup;
@@ -35,6 +36,7 @@ import org.whispersystems.signalservice.api.messages.calls.SignalServiceCallMess
 import org.whispersystems.signalservice.api.messages.multidevice.BlockedListMessage;
 import org.whispersystems.signalservice.api.messages.multidevice.ConfigurationMessage;
 import org.whispersystems.signalservice.api.messages.multidevice.ReadMessage;
+import org.whispersystems.signalservice.api.messages.multidevice.SentTranscriptMessage;
 import org.whispersystems.signalservice.api.messages.multidevice.SignalServiceSyncMessage;
 import org.whispersystems.signalservice.api.messages.multidevice.VerifiedMessage;
 import org.whispersystems.signalservice.api.messages.shared.SharedContact;
@@ -51,7 +53,6 @@ import org.whispersystems.signalservice.internal.push.OutgoingPushMessageList;
 import org.whispersystems.signalservice.internal.push.PushAttachmentData;
 import org.whispersystems.signalservice.internal.push.PushServiceSocket;
 import org.whispersystems.signalservice.internal.push.SendMessageResponse;
-import org.whispersystems.signalservice.internal.push.SignalServiceProtos;
 import org.whispersystems.signalservice.internal.push.SignalServiceProtos.AttachmentPointer;
 import org.whispersystems.signalservice.internal.push.SignalServiceProtos.CallMessage;
 import org.whispersystems.signalservice.internal.push.SignalServiceProtos.Content;
@@ -218,7 +219,7 @@ public class SignalServiceMessageSender {
 
     if ((result.getSuccess() != null && result.getSuccess().isNeedsSync()) || (unidentifiedAccess.isPresent() && isMultiDevice.get())) {
       byte[] syncMessage = createMultiDeviceSentTranscriptContent(content, Optional.of(recipient), timestamp, Collections.singletonList(result));
-      sendMessage(localAddress, getSelfUnidentifiedAccess(unidentifiedAccess), timestamp, syncMessage, false);
+      sendMessage(localAddress, Optional.<UnidentifiedAccess>absent(), timestamp, syncMessage, false);
     }
 
     if (message.isEndSession()) {
@@ -258,7 +259,7 @@ public class SignalServiceMessageSender {
 
     if (needsSyncInResults || (isMultiDevice.get())) {
       byte[] syncMessage = createMultiDeviceSentTranscriptContent(content, Optional.<SignalServiceAddress>absent(), timestamp, results);
-      sendMessage(localAddress, getSelfUnidentifiedAccess(unidentifiedAccess), timestamp, syncMessage, false);
+      sendMessage(localAddress, Optional.<UnidentifiedAccess>absent(), timestamp, syncMessage, false);
     }
 
     return results;
@@ -280,6 +281,8 @@ public class SignalServiceMessageSender {
       content = createMultiDeviceBlockedContent(message.getBlockedList().get());
     } else if (message.getConfiguration().isPresent()) {
       content = createMultiDeviceConfigurationContent(message.getConfiguration().get());
+    } else if (message.getSent().isPresent()) {
+      content = createMultiDeviceSentTranscriptContent(message.getSent().get(), unidentifiedAccess);
     } else if (message.getVerified().isPresent()) {
       sendMessage(message.getVerified().get(), unidentifiedAccess);
       return;
@@ -287,7 +290,7 @@ public class SignalServiceMessageSender {
       throw new IOException("Unsupported sync message!");
     }
 
-    sendMessage(localAddress, getSelfUnidentifiedAccess(unidentifiedAccess), System.currentTimeMillis(), content, false);
+    sendMessage(localAddress, Optional.<UnidentifiedAccess>absent(), System.currentTimeMillis(), content, false);
   }
 
   public void setSoTimeoutMillis(long soTimeoutMillis) {
@@ -306,6 +309,31 @@ public class SignalServiceMessageSender {
   public void setIsMultiDevice(boolean isMultiDevice) {
     this.isMultiDevice.set(isMultiDevice);
   }
+
+  public SignalServiceAttachmentPointer uploadAttachment(SignalServiceAttachmentStream attachment) throws IOException {
+    byte[]             attachmentKey    = Util.getSecretBytes(64);
+    long               paddedLength     = PaddingInputStream.getPaddedSize(attachment.getLength());
+    long               ciphertextLength = AttachmentCipherOutputStream.getCiphertextLength(paddedLength);
+    PushAttachmentData attachmentData   = new PushAttachmentData(attachment.getContentType(),
+                                                                 new PaddingInputStream(attachment.getInputStream(), attachment.getLength()),
+                                                                 ciphertextLength,
+                                                                 new AttachmentCipherOutputStreamFactory(attachmentKey),
+                                                                 attachment.getListener());
+
+    Pair<Long, byte[]> attachmentIdAndDigest = socket.sendAttachment(attachmentData);
+
+    return new SignalServiceAttachmentPointer(attachmentIdAndDigest.first(),
+                                              attachment.getContentType(),
+                                              attachmentKey,
+                                              Optional.of(Util.toIntExact(attachment.getLength())),
+                                              attachment.getPreview(),
+                                              attachment.getWidth(), attachment.getHeight(),
+                                              Optional.of(attachmentIdAndDigest.second()),
+                                              attachment.getFileName(),
+                                              attachment.getVoiceNote(),
+                                              attachment.getCaption());
+  }
+
 
   private void sendMessage(VerifiedMessage message, Optional<UnidentifiedAccessPair> unidentifiedAccess)
       throws IOException, UntrustedIdentityException
@@ -328,13 +356,15 @@ public class SignalServiceMessageSender {
 
     if (result.getSuccess().isNeedsSync()) {
       byte[] syncMessage = createMultiDeviceVerifiedContent(message, nullMessage.toByteArray());
-      sendMessage(localAddress, getSelfUnidentifiedAccess(unidentifiedAccess), message.getTimestamp(), syncMessage, false);
+      sendMessage(localAddress, Optional.<UnidentifiedAccess>absent(), message.getTimestamp(), syncMessage, false);
     }
   }
 
   private byte[] createTypingContent(SignalServiceTypingMessage message) {
     Content.Builder       container = Content.newBuilder();
     TypingMessage.Builder builder   = TypingMessage.newBuilder();
+
+    builder.setTimestamp(message.getTimestamp());
 
     if      (message.isTypingStarted()) builder.setAction(TypingMessage.Action.STARTED);
     else if (message.isTypingStopped()) builder.setAction(TypingMessage.Action.STOPPED);
@@ -483,6 +513,16 @@ public class SignalServiceMessageSender {
                                         .setBlob(createAttachmentPointer(groups)));
 
     return container.setSyncMessage(builder).build().toByteArray();
+  }
+
+  private byte[] createMultiDeviceSentTranscriptContent(SentTranscriptMessage transcript, Optional<UnidentifiedAccessPair> unidentifiedAccess) throws IOException {
+    SignalServiceAddress address = new SignalServiceAddress(transcript.getDestination().get());
+    SendMessageResult    result  = SendMessageResult.success(address, unidentifiedAccess.isPresent(), true);
+
+    return createMultiDeviceSentTranscriptContent(createMessageContent(transcript.getMessage()),
+                                                  Optional.of(address),
+                                                  transcript.getTimestamp(),
+                                                  Collections.singletonList(result));
   }
 
   private byte[] createMultiDeviceSentTranscriptContent(byte[] content, Optional<SignalServiceAddress> recipient,
@@ -818,32 +858,22 @@ public class SignalServiceMessageSender {
       if (attachment.isStream()) {
         Log.w(TAG, "Found attachment, creating pointer...");
         pointers.add(createAttachmentPointer(attachment.asStream()));
+      } else if (attachment.isPointer()) {
+        Log.w(TAG, "Including existing attachment pointer...");
+        pointers.add(createAttachmentPointer(attachment.asPointer()));
       }
     }
 
     return pointers;
   }
 
-  private AttachmentPointer createAttachmentPointer(SignalServiceAttachmentStream attachment)
-      throws IOException
-  {
-    byte[]             attachmentKey    = Util.getSecretBytes(64);
-    long               paddedLength     = PaddingInputStream.getPaddedSize(attachment.getLength());
-    long               ciphertextLength = AttachmentCipherOutputStream.getCiphertextLength(paddedLength);
-    PushAttachmentData attachmentData   = new PushAttachmentData(attachment.getContentType(),
-                                                                 new PaddingInputStream(attachment.getInputStream(), attachment.getLength()),
-                                                                 ciphertextLength,
-                                                                 new AttachmentCipherOutputStreamFactory(attachmentKey),
-                                                                 attachment.getListener());
-
-    Pair<Long, byte[]> attachmentIdAndDigest = socket.sendAttachment(attachmentData);
-
+  private AttachmentPointer createAttachmentPointer(SignalServiceAttachmentPointer attachment) {
     AttachmentPointer.Builder builder = AttachmentPointer.newBuilder()
                                                          .setContentType(attachment.getContentType())
-                                                         .setId(attachmentIdAndDigest.first())
-                                                         .setKey(ByteString.copyFrom(attachmentKey))
-                                                         .setDigest(ByteString.copyFrom(attachmentIdAndDigest.second()))
-                                                         .setSize((int)attachment.getLength());
+                                                         .setId(attachment.getId())
+                                                         .setKey(ByteString.copyFrom(attachment.getKey()))
+                                                         .setDigest(ByteString.copyFrom(attachment.getDigest().get()))
+                                                         .setSize(attachment.getSize().get());
 
     if (attachment.getFileName().isPresent()) {
       builder.setFileName(attachment.getFileName().get());
@@ -865,7 +895,18 @@ public class SignalServiceMessageSender {
       builder.setFlags(AttachmentPointer.Flags.VOICE_MESSAGE_VALUE);
     }
 
+    if (attachment.getCaption().isPresent()) {
+      builder.setCaption(attachment.getCaption().get());
+    }
+
     return builder.build();
+  }
+
+  private AttachmentPointer createAttachmentPointer(SignalServiceAttachmentStream attachment)
+      throws IOException
+  {
+    SignalServiceAttachmentPointer pointer = uploadAttachment(attachment);
+    return createAttachmentPointer(pointer);
   }
 
 
@@ -978,24 +1019,6 @@ public class SignalServiceMessageSender {
     }
 
     return results;
-  }
-
-  private Optional<UnidentifiedAccess> getSelfUnidentifiedAccess(Optional<UnidentifiedAccessPair> unidentifiedAccess) {
-    if (unidentifiedAccess.isPresent()) {
-      return unidentifiedAccess.get().getSelfUnidentifiedAccess();
-    }
-
-    return Optional.absent();
-  }
-
-  private Optional<UnidentifiedAccess> getSelfUnidentifiedAccess(List<Optional<UnidentifiedAccessPair>> unidentifiedAccess) {
-    for (Optional<UnidentifiedAccessPair> item : unidentifiedAccess) {
-      if (item.isPresent() && item.get().getSelfUnidentifiedAccess().isPresent()) {
-        return item.get().getSelfUnidentifiedAccess();
-      }
-    }
-
-    return Optional.absent();
   }
 
   public static interface EventListener {
