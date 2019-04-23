@@ -9,7 +9,6 @@ package org.whispersystems.signalservice.api;
 
 import com.google.protobuf.ByteString;
 
-import org.spongycastle.crypto.InvalidCipherTextException;
 import org.whispersystems.curve25519.Curve25519;
 import org.whispersystems.curve25519.Curve25519KeyPair;
 import org.whispersystems.libsignal.IdentityKey;
@@ -21,6 +20,7 @@ import org.whispersystems.libsignal.state.PreKeyRecord;
 import org.whispersystems.libsignal.state.SignedPreKeyRecord;
 import org.whispersystems.libsignal.util.Pair;
 import org.whispersystems.libsignal.util.guava.Optional;
+import org.whispersystems.signalservice.api.crypto.InvalidCiphertextException;
 import org.whispersystems.signalservice.api.crypto.ProfileCipher;
 import org.whispersystems.signalservice.api.crypto.ProfileCipherOutputStream;
 import org.whispersystems.signalservice.api.messages.calls.TurnServerInfo;
@@ -134,8 +134,8 @@ public class SignalServiceAccountManager {
    *
    * @throws IOException
    */
-  public void requestSmsVerificationCode(boolean androidSmsRetrieverSupported) throws IOException {
-    this.pushServiceSocket.requestSmsVerificationCode(androidSmsRetrieverSupported);
+  public void requestSmsVerificationCode(boolean androidSmsRetrieverSupported, Optional<String> captchaToken) throws IOException {
+    this.pushServiceSocket.requestSmsVerificationCode(androidSmsRetrieverSupported, captchaToken);
   }
 
   /**
@@ -144,8 +144,8 @@ public class SignalServiceAccountManager {
    *
     * @throws IOException
    */
-  public void requestVoiceVerificationCode(Locale locale) throws IOException {
-    this.pushServiceSocket.requestVoiceVerificationCode(locale);
+  public void requestVoiceVerificationCode(Locale locale, Optional<String> captchaToken) throws IOException {
+    this.pushServiceSocket.requestVoiceVerificationCode(locale, captchaToken);
   }
 
   /**
@@ -313,7 +313,7 @@ public class SignalServiceAccountManager {
       }
 
       return results;
-    } catch (InvalidCipherTextException e) {
+    } catch (InvalidCiphertextException e) {
       throw new UnauthenticatedResponseException(e);
     }
   }
@@ -334,17 +334,17 @@ public class SignalServiceAccountManager {
     }
   }
 
-  public void reportContactDiscoveryServiceAttestationError() {
+  public void reportContactDiscoveryServiceAttestationError(String reason) {
     try {
-      this.pushServiceSocket.reportContactDiscoveryServiceAttestationError();
+      this.pushServiceSocket.reportContactDiscoveryServiceAttestationError(reason);
     } catch (IOException e) {
       Log.w(TAG, "Request to indicate a contact discovery attestation error failed. Ignoring.", e);
     }
   }
 
-  public void reportContactDiscoveryServiceUnexpectedError() {
+  public void reportContactDiscoveryServiceUnexpectedError(String reason) {
     try {
-      this.pushServiceSocket.reportContactDiscoveryServiceUnexpectedError();
+      this.pushServiceSocket.reportContactDiscoveryServiceUnexpectedError(reason);
     } catch (IOException e) {
       Log.w(TAG, "Request to indicate a contact discovery unexpected error failed. Ignoring.", e);
     }

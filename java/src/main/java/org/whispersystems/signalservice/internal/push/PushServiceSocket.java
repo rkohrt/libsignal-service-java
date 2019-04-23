@@ -17,7 +17,6 @@ import org.whispersystems.libsignal.state.PreKeyRecord;
 import org.whispersystems.libsignal.state.SignedPreKeyRecord;
 import org.whispersystems.libsignal.util.Pair;
 import org.whispersystems.libsignal.util.guava.Optional;
-import org.whispersystems.signalservice.api.crypto.DigestingOutputStream;
 import org.whispersystems.signalservice.api.crypto.UnidentifiedAccess;
 import org.whispersystems.signalservice.api.messages.SignalServiceAttachment.ProgressListener;
 import org.whispersystems.signalservice.api.messages.calls.TurnServerInfo;
@@ -27,6 +26,7 @@ import org.whispersystems.signalservice.api.push.ContactTokenDetails;
 import org.whispersystems.signalservice.api.push.SignalServiceAddress;
 import org.whispersystems.signalservice.api.push.SignedPreKeyEntity;
 import org.whispersystems.signalservice.api.push.exceptions.AuthorizationFailedException;
+import org.whispersystems.signalservice.api.push.exceptions.CaptchaRequiredException;
 import org.whispersystems.signalservice.api.push.exceptions.ExpectationFailedException;
 import org.whispersystems.signalservice.api.push.exceptions.NonSuccessfulResponseCodeException;
 import org.whispersystems.signalservice.api.push.exceptions.NotFoundException;
@@ -34,6 +34,7 @@ import org.whispersystems.signalservice.api.push.exceptions.PushNetworkException
 import org.whispersystems.signalservice.api.push.exceptions.RateLimitException;
 import org.whispersystems.signalservice.api.push.exceptions.UnregisteredUserException;
 import org.whispersystems.signalservice.api.util.CredentialsProvider;
+import org.whispersystems.signalservice.api.util.Tls12SocketFactory;
 import org.whispersystems.signalservice.internal.configuration.SignalServiceConfiguration;
 import org.whispersystems.signalservice.internal.configuration.SignalUrl;
 import org.whispersystems.signalservice.internal.contacts.entities.DiscoveryRequest;
@@ -50,19 +51,19 @@ import org.whispersystems.signalservice.internal.util.JsonUtil;
 import org.whispersystems.signalservice.internal.util.Util;
 
 import java.io.File;
+import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.UnsupportedEncodingException;
-import java.net.HttpURLConnection;
-import java.net.URL;
 import java.net.URLEncoder;
 import java.security.KeyManagementException;
+import java.security.KeyStore;
+import java.security.KeyStoreException;
 import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.List;
@@ -71,9 +72,9 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
-import javax.net.ssl.HttpsURLConnection;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManager;
+import javax.net.ssl.TrustManagerFactory;
 import javax.net.ssl.X509TrustManager;
 
 import okhttp3.Call;
@@ -86,6 +87,10 @@ import okhttp3.Request;
 import okhttp3.RequestBody;
 import okhttp3.Response;
 import okhttp3.ResponseBody;
+import okio.Buffer;
+import okio.BufferedSink;
+import okio.BufferedSource;
+import okio.Okio;
 
 /**
  * @author Moxie Marlinspike
@@ -124,6 +129,7 @@ public class PushServiceSocket {
   private static final String SENDER_CERTIFICATE_PATH   = "/v1/certificate/delivery";
 
   private static final Map<String, String> NO_HEADERS = Collections.emptyMap();
+  private static final ResponseCodeHandler NO_HANDLER = new EmptyResponseCodeHandler();
 
   private       long      soTimeoutMillis = TimeUnit.SECONDS.toMillis(30);
   private final Set<Call> connections     = new HashSet<>();
@@ -131,6 +137,7 @@ public class PushServiceSocket {
   private final ServiceConnectionHolder[]  serviceClients;
   private final ConnectionHolder[]         cdnClients;
   private final ConnectionHolder[]         contactDiscoveryClients;
+  private final OkHttpClient               attachmentClient;
 
   private final CredentialsProvider credentialsProvider;
   private final String              userAgent;
@@ -142,16 +149,43 @@ public class PushServiceSocket {
     this.serviceClients                    = createServiceConnectionHolders(signalServiceConfiguration.getSignalServiceUrls());
     this.cdnClients                        = createConnectionHolders(signalServiceConfiguration.getSignalCdnUrls());
     this.contactDiscoveryClients           = createConnectionHolders(signalServiceConfiguration.getSignalContactDiscoveryUrls());
+    this.attachmentClient                  = createAttachmentClient();
     this.random                            = new SecureRandom();
   }
 
-  public void requestSmsVerificationCode(boolean androidSmsRetriever) throws IOException {
-    makeServiceRequest(String.format(CREATE_ACCOUNT_SMS_PATH, credentialsProvider.getUser(), androidSmsRetriever ? "android-ng" : "android"), "GET", null, NO_HEADERS);
+  public void requestSmsVerificationCode(boolean androidSmsRetriever, Optional<String> captchaToken) throws IOException {
+    String path = String.format(CREATE_ACCOUNT_SMS_PATH, credentialsProvider.getUser(), androidSmsRetriever ? "android-ng" : "android");
+
+    if (captchaToken.isPresent()) {
+      path += "&captcha=" + captchaToken.get();
+    }
+
+    makeServiceRequest(path, "GET", null, NO_HEADERS, new ResponseCodeHandler() {
+      @Override
+      public void handle(int responseCode) throws NonSuccessfulResponseCodeException {
+        if (responseCode == 402) {
+          throw new CaptchaRequiredException();
+        }
+      }
+    });
   }
 
-  public void requestVoiceVerificationCode(Locale locale) throws IOException {
+  public void requestVoiceVerificationCode(Locale locale, Optional<String> captchaToken) throws IOException {
     Map<String, String> headers = locale != null ? Collections.singletonMap("Accept-Language", locale.getLanguage() + "-" + locale.getCountry()) : NO_HEADERS;
-    makeServiceRequest(String.format(CREATE_ACCOUNT_VOICE_PATH, credentialsProvider.getUser()), "GET", null, headers);
+    String              path    = String.format(CREATE_ACCOUNT_VOICE_PATH, credentialsProvider.getUser());
+
+    if (captchaToken.isPresent()) {
+      path += "?captcha=" + captchaToken.get();
+    }
+    
+    makeServiceRequest(path, "GET", null, headers, new ResponseCodeHandler() {
+      @Override
+      public void handle(int responseCode) throws NonSuccessfulResponseCodeException {
+        if (responseCode == 402) {
+          throw new CaptchaRequiredException();
+        }
+      }
+    });
   }
 
   public void verifyAccountCode(String verificationCode, String signalingKey, int registrationId, boolean fetchesMessages, String pin,
@@ -509,27 +543,31 @@ public class PushServiceSocket {
   }
 
   public void reportContactDiscoveryServiceMatch() throws IOException {
-    makeServiceRequest("/v1/directory/feedback/ok", "PUT", "");
+    makeServiceRequest("/v1/directory/feedback-v2/ok", "PUT", "");
   }
 
   public void reportContactDiscoveryServiceMismatch() throws IOException {
-    makeServiceRequest("/v1/directory/feedback/mismatch", "PUT", "");
+    makeServiceRequest("/v1/directory/feedback-v2/mismatch", "PUT", "");
   }
 
-  public void reportContactDiscoveryServiceServerError() throws IOException {
-    makeServiceRequest("/v1/directory/feedback/server-error", "PUT", "");
+  public void reportContactDiscoveryServiceServerError(String reason) throws IOException {
+    ContactDiscoveryFailureReason failureReason = new ContactDiscoveryFailureReason(reason);
+    makeServiceRequest("/v1/directory/feedback-v2/server-error", "PUT", JsonUtil.toJson(failureReason));
   }
 
-  public void reportContactDiscoveryServiceClientError() throws IOException {
-    makeServiceRequest("/v1/directory/feedback/client-error", "PUT", "");
+  public void reportContactDiscoveryServiceClientError(String reason) throws IOException {
+    ContactDiscoveryFailureReason failureReason = new ContactDiscoveryFailureReason(reason);
+    makeServiceRequest("/v1/directory/feedback-v2/client-error", "PUT", JsonUtil.toJson(failureReason));
   }
 
-  public void reportContactDiscoveryServiceAttestationError() throws IOException {
-    makeServiceRequest("/v1/directory/feedback/attestation-error", "PUT", "");
+  public void reportContactDiscoveryServiceAttestationError(String reason) throws IOException {
+    ContactDiscoveryFailureReason failureReason = new ContactDiscoveryFailureReason(reason);
+    makeServiceRequest("/v1/directory/feedback-v2/attestation-error", "PUT", JsonUtil.toJson(failureReason));
   }
 
-  public void reportContactDiscoveryServiceUnexpectedError() throws IOException {
-    makeServiceRequest("/v1/directory/feedback/unexpected-error", "PUT", "");
+  public void reportContactDiscoveryServiceUnexpectedError(String reason) throws IOException {
+    ContactDiscoveryFailureReason failureReason = new ContactDiscoveryFailureReason(reason);
+    makeServiceRequest("/v1/directory/feedback-v2/unexpected-error", "PUT", JsonUtil.toJson(failureReason));
   }
 
   public TurnServerInfo getTurnServerInfo() throws IOException {
@@ -551,97 +589,106 @@ public class PushServiceSocket {
     }
   }
 
-  private void downloadAttachment(String url, File localDestination, int maxSizeBytes, ProgressListener listener)
-      throws IOException
-  {
-    URL               downloadUrl = new URL(url);
-    HttpURLConnection connection  = (HttpURLConnection) downloadUrl.openConnection();
-    connection.setRequestProperty("Content-Type", "application/octet-stream");
-    connection.setRequestMethod("GET");
-    connection.setDoInput(true);
+  private void downloadAttachment(String url, File localDestination, int maxSizeBytes, ProgressListener listener) throws PushNetworkException, NonSuccessfulResponseCodeException {
+    Request request = new Request.Builder().url(url)
+                                           .addHeader("Content-Type", "application/octet-stream")
+                                           .get()
+                                           .build();
+
+    Call    call   = attachmentClient.newBuilder()
+                                     .connectTimeout(soTimeoutMillis, TimeUnit.MILLISECONDS)
+                                     .readTimeout(soTimeoutMillis, TimeUnit.MILLISECONDS)
+                                     .build()
+                                     .newCall(request);
+
+    synchronized (connections) {
+      connections.add(call);
+    }
+
+    Response     response;
+    ResponseBody body;
 
     try {
-      if (connection.getResponseCode() != 200) {
-        throw new NonSuccessfulResponseCodeException("Bad response: " + connection.getResponseCode());
+      response = call.execute();
+      body     = response.body();
+    } catch (IOException e) {
+      throw new PushNetworkException(e);
+    } finally {
+      synchronized (connections) {
+        connections.remove(call);
       }
+    }
 
-      OutputStream output        = new FileOutputStream(localDestination);
-      InputStream  input         = connection.getInputStream();
-      byte[]       buffer        = new byte[32768];
-      int          contentLength = connection.getContentLength();
-      int         read,totalRead = 0;
+    if (!response.isSuccessful()) {
+      throw new NonSuccessfulResponseCodeException("Bad response: " + response.code());
+    }
+
+    if (body == null) {
+      throw new NonSuccessfulResponseCodeException("Response body is empty!");
+    }
+
+    try {
+      long           contentLength = body.contentLength();
+      BufferedSource source        = body.source();
+      BufferedSink   sink          = Okio.buffer(Okio.sink(localDestination));
+      Buffer         sinkBuffer    = sink.buffer();
 
       if (contentLength > maxSizeBytes) {
         throw new NonSuccessfulResponseCodeException("File exceeds maximum size.");
       }
 
-      while ((read = input.read(buffer)) != -1) {
-        output.write(buffer, 0, read);
-        totalRead += read;
+      long totalBytesRead = 0;
 
-        if (totalRead > maxSizeBytes) {
-          localDestination.delete();
-          throw new NonSuccessfulResponseCodeException("File exceeds maximum size.");
-        }
+      for (long readCount; (readCount = source.read(sinkBuffer, 8192)) != -1; ) {
+        totalBytesRead += readCount;
+        sink.emitCompleteSegments();
 
         if (listener != null) {
-          listener.onAttachmentProgress(contentLength, totalRead);
+          listener.onAttachmentProgress(contentLength, totalBytesRead);
         }
       }
 
-      output.close();
-      Log.w(TAG, "Downloaded: " + url + " to: " + localDestination.getAbsolutePath());
-    } catch (IOException ioe) {
-      throw new PushNetworkException(ioe);
-    } finally {
-      connection.disconnect();
+      sink.flush();
+      sink.close();
+      body.close();
+    } catch (FileNotFoundException e) {
+      throw new AssertionError(e);
+    } catch (IOException e) {
+      throw new PushNetworkException(e);
     }
   }
 
   private byte[] uploadAttachment(String method, String url, InputStream data,
                                   long dataSize, OutputStreamFactory outputStreamFactory, ProgressListener listener)
-    throws IOException
+      throws PushNetworkException, NonSuccessfulResponseCodeException
   {
-    URL                uploadUrl  = new URL(url);
-    HttpsURLConnection connection = (HttpsURLConnection) uploadUrl.openConnection();
-    connection.setDoOutput(true);
+    DigestingRequestBody requestBody = new DigestingRequestBody(data, outputStreamFactory, "application/octet-stream", dataSize, listener);
+    Request.Builder      request     = new Request.Builder().url(url).method(method, requestBody);
+    Call                 call        = attachmentClient.newBuilder()
+                                                       .connectTimeout(soTimeoutMillis, TimeUnit.MILLISECONDS)
+                                                       .readTimeout(soTimeoutMillis, TimeUnit.MILLISECONDS)
+                                                       .build()
+                                                       .newCall(request.build());
 
-    if (dataSize > 0) {
-      connection.setFixedLengthStreamingMode(Util.toIntExact(dataSize));
-    } else {
-      connection.setChunkedStreamingMode(0);
+    synchronized (connections) {
+      connections.add(call);
     }
 
-    connection.setRequestMethod(method);
-    connection.setRequestProperty("Content-Type", "application/octet-stream");
-    connection.setRequestProperty("Connection", "close");
-    connection.connect();
-
     try {
-      DigestingOutputStream out    = outputStreamFactory.createFor(connection.getOutputStream());
-      byte[]                buffer = new byte[32768];
-      int            read, written = 0;
+      Response response;
 
-      while ((read = data.read(buffer)) != -1) {
-        out.write(buffer, 0, read);
-        written += read;
-
-        if (listener != null) {
-          listener.onAttachmentProgress(dataSize, written);
-        }
+      try {
+        response = call.execute();
+      } catch (IOException e) {
+        throw new PushNetworkException(e);
       }
 
-      out.flush();
-      data.close();
-      out.close();
-
-      if (connection.getResponseCode() != 200) {
-        throw new IOException("Bad response: " + connection.getResponseCode() + " " + connection.getResponseMessage());
-      }
-
-      return out.getTransmittedDigest();
+      if (response.isSuccessful()) return requestBody.getTransmittedDigest();
+      else                         throw new NonSuccessfulResponseCodeException("Response: " + response);
     } finally {
-      connection.disconnect();
+      synchronized (connections) {
+        connections.remove(call);
+      }
     }
   }
 
@@ -715,7 +762,7 @@ public class PushServiceSocket {
                                                         .readTimeout(soTimeoutMillis, TimeUnit.MILLISECONDS)
                                                         .build();
 
-    DigestingRequestBody file = new DigestingRequestBody(data, outputStreamFactory, contentType, length);
+    DigestingRequestBody file = new DigestingRequestBody(data, outputStreamFactory, contentType, length, null);
 
     RequestBody requestBody = new MultipartBody.Builder()
         .setType(MultipartBody.FORM)
@@ -763,16 +810,28 @@ public class PushServiceSocket {
   private String makeServiceRequest(String urlFragment, String method, String body)
       throws NonSuccessfulResponseCodeException, PushNetworkException
   {
-    return makeServiceRequest(urlFragment, method, body, NO_HEADERS, Optional.<UnidentifiedAccess>absent());
+    return makeServiceRequest(urlFragment, method, body, NO_HEADERS, NO_HANDLER, Optional.<UnidentifiedAccess>absent());
   }
 
   private String makeServiceRequest(String urlFragment, String method, String body, Map<String, String> headers)
       throws NonSuccessfulResponseCodeException, PushNetworkException
   {
-    return makeServiceRequest(urlFragment, method, body, headers, Optional.<UnidentifiedAccess>absent());
+    return makeServiceRequest(urlFragment, method, body, headers, NO_HANDLER, Optional.<UnidentifiedAccess>absent());
+  }
+
+  private String makeServiceRequest(String urlFragment, String method, String body, Map<String, String> headers, ResponseCodeHandler responseCodeHandler)
+      throws NonSuccessfulResponseCodeException, PushNetworkException
+  {
+    return makeServiceRequest(urlFragment, method, body, headers, responseCodeHandler, Optional.<UnidentifiedAccess>absent());
   }
 
   private String makeServiceRequest(String urlFragment, String method, String body, Map<String, String> headers, Optional<UnidentifiedAccess> unidentifiedAccessKey)
+      throws NonSuccessfulResponseCodeException, PushNetworkException
+  {
+    return makeServiceRequest(urlFragment, method, body, headers, NO_HANDLER, unidentifiedAccessKey);
+  }
+
+  private String makeServiceRequest(String urlFragment, String method, String body, Map<String, String> headers, ResponseCodeHandler responseCodeHandler, Optional<UnidentifiedAccess> unidentifiedAccessKey)
       throws NonSuccessfulResponseCodeException, PushNetworkException
   {
     Response response = getServiceConnection(urlFragment, method, body, headers, unidentifiedAccessKey);
@@ -788,6 +847,8 @@ public class PushServiceSocket {
     } catch (IOException ioe) {
       throw new PushNetworkException(ioe);
     }
+
+    responseCodeHandler.handle(responseCode);
 
     switch (responseCode) {
       case 413:
@@ -1003,10 +1064,28 @@ public class PushServiceSocket {
       context.init(null, trustManagers, null);
 
       return new OkHttpClient.Builder()
-                             .sslSocketFactory(context.getSocketFactory(), (X509TrustManager)trustManagers[0])
-                             .connectionSpecs(url.getConnectionSpecs().or(Util.immutableList(ConnectionSpec.MODERN_TLS, ConnectionSpec.COMPATIBLE_TLS)))
+                             .sslSocketFactory(new Tls12SocketFactory(context.getSocketFactory()), (X509TrustManager)trustManagers[0])
+                             .connectionSpecs(url.getConnectionSpecs().or(Util.immutableList(ConnectionSpec.RESTRICTED_TLS)))
                              .build();
     } catch (NoSuchAlgorithmException | KeyManagementException e) {
+      throw new AssertionError(e);
+    }
+  }
+
+  private OkHttpClient createAttachmentClient() {
+    try {
+      SSLContext context = SSLContext.getInstance("TLS");
+      context.init(null, null, null);
+
+      TrustManagerFactory trustManagerFactory = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+      trustManagerFactory.init((KeyStore)null);
+
+      return new OkHttpClient.Builder()
+                             .sslSocketFactory(new Tls12SocketFactory(context.getSocketFactory()),
+                                               (X509TrustManager)trustManagerFactory.getTrustManagers()[0])
+                             .connectionSpecs(Util.immutableList(ConnectionSpec.RESTRICTED_TLS))
+                             .build();
+    } catch (NoSuchAlgorithmException | KeyManagementException | KeyStoreException e) {
       throw new AssertionError(e);
     }
   }
@@ -1114,4 +1193,12 @@ public class PushServiceSocket {
     }
   }
 
+  private interface ResponseCodeHandler {
+    void handle(int responseCode) throws NonSuccessfulResponseCodeException, PushNetworkException;
+  }
+
+  private static class EmptyResponseCodeHandler implements ResponseCodeHandler {
+    @Override
+    public void handle(int responseCode) { }
+  }
 }
